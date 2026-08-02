@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.request import HTTPXRequest
 
 load_dotenv()
 
@@ -313,14 +314,26 @@ async def post_shutdown(app: Application) -> None:
 def main() -> None:
     if not TOKEN:
         raise RuntimeError("未设置 TELEGRAM_BOT_TOKEN。请复制 .env.example 为 .env 并填入 Token。")
-    app = Application.builder().token(TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+    # Telegram can occasionally respond slowly from some VPS networks.  Keep the
+    # bot alive and retry rather than aborting during the initial getMe request.
+    request = HTTPXRequest(connect_timeout=20, read_timeout=30, write_timeout=30, pool_timeout=20)
+    get_updates_request = HTTPXRequest(connect_timeout=20, read_timeout=35, write_timeout=30, pool_timeout=20)
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .request(request)
+        .get_updates_request(get_updates_request)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("set", set_alert))
     app.add_handler(CommandHandler("list", list_alerts))
     app.add_handler(CommandHandler("delete", delete_alert))
     app.add_handler(CommandHandler("price", price))
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, bootstrap_retries=-1)
 
 
 if __name__ == "__main__":
