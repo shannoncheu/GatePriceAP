@@ -1,57 +1,95 @@
-# Gate 合约价格提醒 Telegram 机器人
+# Gate 合约价格提醒 Bot
 
-监控 Gate 的 **USDT 永续合约最新成交价**。当价格达到你设置的条件时，机器人会立刻发送 Telegram 消息。程序不下单、不读取 Gate 账户，也不需要 Gate API Key。
+一个 Telegram 价格提醒机器人，监控 Gate USDT 永续合约的最新成交价。达到设定条件后，向设置提醒的聊天发送通知。
+
+程序只读取公开行情，不下单，不需要 Gate API Key，也不会访问 Gate 账户。
 
 ## 功能
 
-- 每位 Telegram 用户最多 3 条有效提醒
-- 支持 `BTC`、`BTC_USDT`、`BTC/USDT` 等输入
-- `up`：价格大于或等于目标价时触发；`down`：价格小于或等于目标价时触发
-- 触发后自动删除，防止重复通知
-- 使用 SQLite 保存提醒；重启后未触发的提醒仍在
-
-## 安装和运行
-
-需要 Python 3.10 或更高版本。
-
-```powershell
-cd gate-price-alert-bot
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-Copy-Item .env.example .env
-```
-
-打开 `.env`，填入从 Telegram [@BotFather](https://t.me/BotFather) 创建机器人后拿到的 Token：
-
-```ini
-TELEGRAM_BOT_TOKEN=123456:ABC...
-```
-
-启动：
-
-```powershell
-python main.py
-```
-
-首次使用时，在 Telegram 打开你的机器人并发送 `/start`。
+- 监控 Gate USDT 永续合约最新成交价
+- 支持 `BTC`、`BTC_USDT` 和 `BTC/USDT` 格式
+- `up`：当前价大于或等于目标价时通知
+- `down`：当前价小于或等于目标价时通知
+- 每个 Telegram 用户最多 3 条有效提醒
+- 提醒触发后自动关闭
+- 提醒存储在本地 SQLite 数据库；服务重启后仍会保留
 
 ## 命令
 
 ```text
 /set BTC 120000 up
 /set ETH_USDT 3000 down
+/price BTC
 /list
 /delete 1
-/price BTC
 ```
 
-`/price` 只显示当前已被提醒订阅的合约价格；先通过 `/set` 订阅即可。
+## 配置
 
-## 部署建议
+需要 Python 3.10 或更高版本。
 
-本机退出或断网后将无法监控。要全天运行，请部署到一台持续在线的 VPS 或云服务，并保留同目录下的 `alerts.db` 文件。不要把 `.env` 或真实 Telegram Token 上传到 GitHub。
+```bash
+git clone https://github.com/shannoncheu/gate-price-alert-bot.git
+cd gate-price-alert-bot
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+```
 
-## 行情来源
+编辑 `.env`：
 
-机器人订阅 Gate 的公开 `futures.tickers` WebSocket 频道，读取 `last`（最新成交价）字段。Gate 的官方 WebSocket 文档：<https://www.gate.com/docs/developers/futures/ws/en/>。
+```ini
+TELEGRAM_BOT_TOKEN=从BotFather获取的Token
+LOG_LEVEL=WARNING
+```
+
+启动：
+
+```bash
+python main.py
+```
+
+## 后台运行（systemd）
+
+服务文件 `/etc/systemd/system/gate-price-alert-bot.service`：
+
+```ini
+[Unit]
+Description=Gate Price Alert Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/gate-price-alert-bot
+EnvironmentFile=/root/gate-price-alert-bot/.env
+ExecStart=/root/gate-price-alert-bot/.venv/bin/python /root/gate-price-alert-bot/main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+启用服务：
+
+```bash
+systemctl daemon-reload
+systemctl enable --now gate-price-alert-bot
+```
+
+常用命令：
+
+```bash
+systemctl status gate-price-alert-bot
+systemctl restart gate-price-alert-bot
+journalctl -u gate-price-alert-bot -f
+```
+
+## 数据与安全
+
+`.env` 包含 Telegram Token，`alerts.db` 包含提醒数据。两者均不应上传到 GitHub。行情使用 Gate 的公开 `futures.tickers` WebSocket 频道，价格字段为 `last`（最新成交价）。
+
+Gate WebSocket 文档：<https://www.gate.com/docs/developers/futures/ws/en/>
