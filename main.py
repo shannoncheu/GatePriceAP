@@ -29,6 +29,9 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# Successful Telegram polling requests are routine and otherwise make the
+# terminal noisy every few seconds. Errors still remain visible.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
