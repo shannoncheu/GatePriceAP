@@ -133,16 +133,19 @@ def parse_target(value: str) -> Decimal:
     return target
 
 
-HELP_TEXT = """<b>Gate 合约价格提醒机器人</b>
+HELP_TEXT = """<b>嗨，我是你的 Gate 合约小雷达</b>
 
-设置提醒：<code>/set BTC 120000 up</code>
-下跌提醒：<code>/set ETH_USDT 3000 down</code>
-查看当前价格：<code>/price BTC</code>
-查看提醒：<code>/list</code>
-删除提醒：<code>/delete 1</code>
+想盯哪一个价格，交给我就好：
+<code>/set BTC 120000 up</code>
+<code>/set ETH_USDT 3000 down</code>
 
-参数：币种/合约、目标价格、方向。方向 <code>up</code> 代表价格 ≥ 目标价，<code>down</code> 代表价格 ≤ 目标价。
-每位用户最多 3 条有效提醒，触发后自动删除。价格来源为 Gate USDT 永续合约的最新成交价。"""
+其他小指令：
+<code>/price BTC</code>　看看已订阅合约的最新价
+<code>/list</code>　看看我正在替你盯什么
+<code>/delete 1</code>　删除编号为 1 的提醒
+
+<code>up</code> 表示价格到达或高于目标价，<code>down</code> 表示价格到达或低于目标价。
+每位用户最多可保留 3 条提醒；价格一到，我就马上来报信。"""
 
 
 class GateMonitor:
@@ -210,13 +213,13 @@ class GateMonitor:
         self.store.delete_many([alert.id for alert, _ in triggered])
         self.request_reload()
         for alert, price in triggered:
-            direction = "上涨至" if alert.direction == "up" else "下跌至"
+            direction = "涨到" if alert.direction == "up" else "跌到"
             try:
                 await self.app.bot.send_message(
                     chat_id=alert.chat_id,
-                    text=(f"🔔 <b>价格触发</b>\n\n{alert.contract} {direction}目标价。\n"
-                          f"目标：<code>{alert.target}</code> USDT\n当前：<code>{price}</code> USDT\n\n"
-                          "该提醒已自动关闭。"),
+                    text=(f"<b>叮咚，价格到站啦！</b>\n\n{alert.contract} 已经{direction}你设的价位。\n"
+                          f"目标价：<code>{alert.target}</code> USDT\n现在价：<code>{price}</code> USDT\n\n"
+                          "这条提醒我先替你收好啦。"),
                     parse_mode=ParseMode.HTML,
                 )
             except Exception:
@@ -237,7 +240,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def set_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) != 3:
-        await update.effective_message.reply_text("用法：/set BTC 120000 up\n方向：up 或 down")
+        await update.effective_message.reply_text("差一点点，就这样发给我：\n/set BTC 120000 up\n方向填 up 或 down。")
         return
     try:
         contract = normalize_contract(context.args[0])
@@ -250,16 +253,16 @@ async def set_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     get_monitor(context).request_reload()
     relation = "≥" if direction == "up" else "≤"
     await update.effective_message.reply_html(
-        f"✅ 已添加提醒 #{alert_id}\n<code>{contract}</code> 价格 {relation} <code>{target}</code> USDT"
+        f"好呀，已经帮你盯住啦。\n提醒 #{alert_id}：<code>{contract}</code> 价格 {relation} <code>{target}</code> USDT"
     )
 
 
 async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     alerts = get_store(context).list_for_chat(update.effective_chat.id)
     if not alerts:
-        await update.effective_message.reply_text("你目前没有有效提醒。")
+        await update.effective_message.reply_text("现在还没有要盯的价格，要不要给我一条 /set 指令？")
         return
-    lines = ["<b>当前提醒</b>"]
+    lines = ["<b>我正在替你盯着这些：</b>"]
     for alert in alerts:
         relation = "≥" if alert.direction == "up" else "≤"
         lines.append(f"#{alert.id}  <code>{alert.contract}</code>  {relation} <code>{alert.target}</code> USDT")
@@ -273,9 +276,9 @@ async def delete_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     deleted = get_store(context).delete(update.effective_chat.id, int(context.args[0]))
     if deleted:
         get_monitor(context).request_reload()
-        await update.effective_message.reply_text("已删除该提醒。")
+        await update.effective_message.reply_text("好，这条提醒已经撤下啦。")
     else:
-        await update.effective_message.reply_text("找不到这个提醒编号。")
+        await update.effective_message.reply_text("我没找到这条提醒，再用 /list 看看编号吧。")
 
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
