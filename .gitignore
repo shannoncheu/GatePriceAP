@@ -1,0 +1,4 @@
+.env
+alerts.db
+__pycache__/
+*.py[cod]
