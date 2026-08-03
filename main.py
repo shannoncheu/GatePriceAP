@@ -29,10 +29,6 @@ MAX_POSITIONS_PER_USER = 3
 MAX_WATCHLIST_PER_USER = 20
 GATE_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 GATE_REST_TICKERS_URL = "https://api.gateio.ws/api/v4/futures/usdt/tickers"
-LOGO_URL_TEMPLATE = (
-    "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/"
-    "master/128/color/{symbol}.png"
-)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -260,26 +256,6 @@ def parse_leverage(value: str) -> Decimal:
     return leverage
 
 
-def logo_url(contract: str) -> str:
-    """Return a best-effort public logo URL for the base currency."""
-    return LOGO_URL_TEMPLATE.format(symbol=contract.split("_", 1)[0].lower())
-
-
-async def send_contract_photo_or_text(
-    bot, chat_id: int, contract: str, text: str
-) -> None:
-    """Use a coin logo when it exists; still deliver the text if it does not."""
-    try:
-        await bot.send_photo(
-            chat_id=chat_id,
-            photo=logo_url(contract),
-            caption=text,
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
-
-
 def _fetch_gate_price_sync(contract: str) -> Decimal:
     query = urlencode({"contract": contract})
     with urlopen(f"{GATE_REST_TICKERS_URL}?{query}", timeout=10) as response:
@@ -391,13 +367,12 @@ class GateMonitor:
         for alert, price in triggered:
             direction = "上涨至" if alert.direction == "up" else "下跌至"
             try:
-                await send_contract_photo_or_text(
-                    self.app.bot,
-                    alert.chat_id,
-                    alert.contract,
-                    f"<b>价格提醒已触发</b>\n\n{alert.contract} {direction}目标价。\n"
-                    f"目标价：<code>{alert.target}</code> USDT\n当前价：<code>{price}</code> USDT\n\n"
-                    "该提醒已自动关闭。",
+                await self.app.bot.send_message(
+                    chat_id=alert.chat_id,
+                    text=(f"<b>价格提醒已触发</b>\n\n{alert.contract} {direction}目标价。\n"
+                          f"目标价：<code>{alert.target}</code> USDT\n当前价：<code>{price}</code> USDT\n\n"
+                          "该提醒已自动关闭。"),
+                    parse_mode=ParseMode.HTML,
                 )
             except Exception:
                 logger.exception("Could not notify chat %s for alert %s", alert.chat_id, alert.id)
@@ -475,11 +450,8 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.effective_message.reply_text(str(exc))
             return
         get_monitor(context).last_prices[contract] = value
-    await send_contract_photo_or_text(
-        context.bot,
-        update.effective_chat.id,
-        contract,
-        f"<b>{contract}</b>\n最新成交价：<code>{value}</code> USDT",
+    await update.effective_message.reply_html(
+        f"<b>{contract}</b>\n最新成交价：<code>{value}</code> USDT"
     )
 
 
