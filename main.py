@@ -24,7 +24,12 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "alerts.db"))
 MAX_ALERTS_PER_USER = 3
 MAX_POSITIONS_PER_USER = 3
+MAX_WATCHLIST_PER_USER = 20
 GATE_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
+LOGO_URL_TEMPLATE = (
+    "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/"
+    "master/128/color/{symbol}.png"
+)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -56,6 +61,11 @@ class Position:
     leverage: Decimal
 
 
+@dataclass(frozen=True)
+class WatchItem:
+    contract: str
+
+
 class AlertStore:
     def __init__(self, path: Path) -> None:
         self.connection = sqlite3.connect(path)
@@ -83,6 +93,15 @@ class AlertStore:
                 entry_price TEXT NOT NULL,
                 leverage TEXT NOT NULL,
                 created_at INTEGER NOT NULL
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS watchlist (
+                chat_id INTEGER NOT NULL,
+                contract TEXT NOT NULL,
+                PRIMARY KEY (chat_id, contract)
             )
             """
         )
@@ -164,6 +183,26 @@ class AlertStore:
         self.connection.commit()
         return cursor.rowcount > 0
 
+    def replace_watchlist(self, chat_id: int, contracts: list[str]) -> None:
+        if len(contracts) > MAX_WATCHLIST_PER_USER:
+            raise ValueError(f"观察列表最多只能保留 {MAX_WATCHLIST_PER_USER} 个币种。")
+        self.connection.execute("DELETE FROM watchlist WHERE chat_id = ?", (chat_id,))
+        self.connection.executemany(
+            "INSERT INTO watchlist(chat_id, contract) VALUES (?, ?)",
+            [(chat_id, contract) for contract in contracts],
+        )
+        self.connection.commit()
+
+    def list_watchlist_for_chat(self, chat_id: int) -> list[WatchItem]:
+        rows = self.connection.execute(
+            "SELECT contract FROM watchlist WHERE chat_id = ? ORDER BY contract", (chat_id,)
+        ).fetchall()
+        return [WatchItem(row["contract"]) for row in rows]
+
+    def all_watchlist_contracts(self) -> set[str]:
+        rows = self.connection.execute("SELECT DISTINCT contract FROM watchlist").fetchall()
+        return {row["contract"] for row in rows}
+
     @staticmethod
     def _row_to_alert(row: sqlite3.Row) -> Alert:
         return Alert(row["id"], row["chat_id"], row["contract"], row["direction"], Decimal(row["target"]))
@@ -218,6 +257,26 @@ def parse_leverage(value: str) -> Decimal:
     return leverage
 
 
+def logo_url(contract: str) -> str:
+    """Return a best-effort public logo URL for the base currency."""
+    return LOGO_URL_TEMPLATE.format(symbol=contract.split("_", 1)[0].lower())
+
+
+async def send_contract_photo_or_text(
+    bot, chat_id: int, contract: str, text: str
+) -> None:
+    """Use a coin logo when it exists; still deliver the text if it does not."""
+    try:
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=logo_url(contract),
+            caption=text,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+
+
 HELP_TEXT = """<b>Gate 合约价格提醒</b>
 
 设置提醒：<code>/set BTC 120000 up</code>
@@ -231,10 +290,14 @@ HELP_TEXT = """<b>Gate 合约价格提醒</b>
 查看持仓列表：<code>/positions</code>
 删除持仓：<code>/closeposition 1</code>
 
+设置观察列表：<code>/watch BTC ETH SOL</code>
+查看观察列表：<code>/watchlist</code>
+清空观察列表：<code>/clearwatch</code>
+
 <code>up</code>：价格 ≥ 目标价时触发。
 <code>down</code>：价格 ≤ 目标价时触发。
 持仓参数依次为：合约、方向（long/short）、数量、开仓价、杠杆。数量按币的实际数量输入。
-每位用户最多可保留 3 条提醒和 3 个持仓；提醒触发后自动关闭。"""
+每位用户最多可保留 3 条提醒、3 个持仓和 20 个观察币种；提醒触发后自动关闭。"""
 
 
 class GateMonitor:
@@ -251,7 +314,9 @@ class GateMonitor:
     async def run(self) -> None:
         while True:
             contracts = sorted(
-                {alert.contract for alert in self.store.all()} | {position.contract for position in self.store.all_positions()}
+                {alert.contract for alert in self.store.all()}
+                | {position.contract for position in self.store.all_positions()}
+                | self.store.all_watchlist_contracts()
             )
             if not contracts:
                 self.reload_requested.clear()
@@ -306,12 +371,13 @@ class GateMonitor:
         for alert, price in triggered:
             direction = "上涨至" if alert.direction == "up" else "下跌至"
             try:
-                await self.app.bot.send_message(
-                    chat_id=alert.chat_id,
-                    text=(f"<b>价格提醒已触发</b>\n\n{alert.contract} {direction}目标价。\n"
-                          f"目标价：<code>{alert.target}</code> USDT\n当前价：<code>{price}</code> USDT\n\n"
-                          "该提醒已自动关闭。"),
-                    parse_mode=ParseMode.HTML,
+                await send_contract_photo_or_text(
+                    self.app.bot,
+                    alert.chat_id,
+                    alert.contract,
+                    f"<b>价格提醒已触发</b>\n\n{alert.contract} {direction}目标价。\n"
+                    f"目标价：<code>{alert.target}</code> USDT\n当前价：<code>{price}</code> USDT\n\n"
+                    "该提醒已自动关闭。",
                 )
             except Exception:
                 logger.exception("Could not notify chat %s for alert %s", alert.chat_id, alert.id)
@@ -385,7 +451,57 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if value is None:
         await update.effective_message.reply_text("该合约尚未订阅或没有行情。先用 /set 或 /position 添加；请确认合约名称正确。")
     else:
-        await update.effective_message.reply_html(f"<code>{contract}</code> 最新成交价：<code>{value}</code> USDT")
+        await send_contract_photo_or_text(
+            context.bot,
+            update.effective_chat.id,
+            contract,
+            f"<b>{contract}</b>\n最新成交价：<code>{value}</code> USDT",
+        )
+
+
+async def set_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.effective_message.reply_text(
+            "用法：/watch BTC ETH SOL\n一次输入 1 到 20 个币种，会覆盖原来的观察列表。"
+        )
+        return
+    try:
+        contracts = list(dict.fromkeys(normalize_contract(item) for item in context.args))
+        get_store(context).replace_watchlist(update.effective_chat.id, contracts)
+    except ValueError as exc:
+        await update.effective_message.reply_text(str(exc))
+        return
+    get_monitor(context).request_reload()
+    symbols = ", ".join(contract.removesuffix("_USDT") for contract in contracts)
+    await update.effective_message.reply_text(
+        f"观察列表已更新（{len(contracts)}/20）：{symbols}\n发送 /watchlist 查看最新价格。"
+    )
+
+
+async def show_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    items = get_store(context).list_watchlist_for_chat(update.effective_chat.id)
+    if not items:
+        await update.effective_message.reply_text("观察列表为空。用 /watch BTC ETH SOL 添加。")
+        return
+    prices = get_monitor(context).last_prices
+    lines = ["<b>观察列表</b>"]
+    unavailable: list[str] = []
+    for item in items:
+        value = prices.get(item.contract)
+        symbol = item.contract.removesuffix("_USDT")
+        if value is None:
+            unavailable.append(symbol)
+        else:
+            lines.append(f"<code>{symbol}</code>  <code>{value}</code> USDT")
+    if unavailable:
+        lines.append(f"\n正在获取：{', '.join(unavailable)}，请稍后再试。")
+    await update.effective_message.reply_html("\n".join(lines))
+
+
+async def clear_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    get_store(context).replace_watchlist(update.effective_chat.id, [])
+    get_monitor(context).request_reload()
+    await update.effective_message.reply_text("观察列表已清空。")
 
 
 def format_usdt(value: Decimal) -> str:
@@ -532,6 +648,9 @@ def main() -> None:
     app.add_handler(CommandHandler("list", list_alerts))
     app.add_handler(CommandHandler("delete", delete_alert))
     app.add_handler(CommandHandler("price", price))
+    app.add_handler(CommandHandler("watch", set_watchlist))
+    app.add_handler(CommandHandler("watchlist", show_watchlist))
+    app.add_handler(CommandHandler("clearwatch", clear_watchlist))
     app.add_handler(CommandHandler("position", set_position))
     app.add_handler(CommandHandler("pnl", pnl))
     app.add_handler(CommandHandler("positions", list_positions))
