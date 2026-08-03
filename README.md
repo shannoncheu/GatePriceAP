@@ -16,6 +16,7 @@
 - 手动记录合约持仓，按最新价计算未实现盈亏、保证金和收益率
 - 可设置最多 20 个币种的观察列表并随时查询最新价格
 - 任意 Gate USDT 永续合约都可用 `/price` 查询，不需要先加入提醒、持仓或观察列表
+- 可选接入 OpenAI API，直接用自然语言查价格、查盈亏和获得简短持仓风险提示
 
 ## 命令
 
@@ -32,11 +33,23 @@
 /pnl
 /positions
 /closeposition 1
+/whoami
 ```
 
 `/position` 参数依次为：合约、方向、实际持仓数量、开仓价、杠杆。方向支持 `long`（多单）和 `short`（空单）。
 
 `/watch` 一次输入 1 到 20 个币种，会覆盖旧的观察列表；发送 `/watchlist` 查看这些合约的最新价格。
+
+配置 AI 后，也可以直接发送普通文字，例如：
+
+```text
+BTC 现在多少钱？
+查看我的持仓盈亏
+看看我的持仓，简单说说风险
+我的观察列表里有什么？
+```
+
+AI 只负责理解自然语言和整理简短说明。实时价格、盈亏和收益率仍由 Gate 行情与程序计算；机器人不会自动下单。
 
 ## 配置
 
@@ -55,8 +68,13 @@ cp .env.example .env
 
 ```ini
 TELEGRAM_BOT_TOKEN=从BotFather获取的Token
+OPENAI_API_KEY=你的OpenAI API Key
+OPENAI_MODEL=gpt-5.6-luna
+AI_ALLOWED_TELEGRAM_USER_IDS=你的Telegram数字用户ID
 LOG_LEVEL=WARNING
 ```
+
+`OPENAI_API_KEY` 为空时，原来的命令功能仍可正常使用。部署后先向机器人发送 `/whoami` 获取自己的数字 ID，再填入允许名单；多人使用时用英文逗号分隔。允许名单可防止其他人消耗你的 OpenAI API 额度。
 
 启动：
 
@@ -104,6 +122,6 @@ journalctl -u gate-price-alert-bot -f
 
 ## 数据与安全
 
-`.env` 包含 Telegram Token，`alerts.db` 包含提醒数据。两者均不应上传到 GitHub。行情使用 Gate 的公开 `futures.tickers` WebSocket 频道，价格字段为 `last`（最新成交价）。
+`.env` 包含 Telegram Token 和 OpenAI API Key，`alerts.db` 包含提醒及持仓数据。两者均不应上传到 GitHub。启用自然语言功能后，用户发送的文字以及程序整理的持仓、提醒和观察列表数据会发给 OpenAI 生成回答；不会发送 Telegram Token 或 OpenAI API Key。行情使用 Gate 的公开 `futures.tickers` WebSocket 频道，价格字段为 `last`（最新成交价）。
 
 Gate WebSocket 文档：<https://www.gate.com/docs/developers/futures/ws/en/>
