@@ -23,6 +23,7 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "alerts.db"))
 MAX_ALERTS_PER_USER = 3
+MAX_POSITIONS_PER_USER = 3
 GATE_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 
 logging.basicConfig(
@@ -44,6 +45,17 @@ class Alert:
     target: Decimal
 
 
+@dataclass(frozen=True)
+class Position:
+    id: int
+    chat_id: int
+    contract: str
+    side: str
+    quantity: Decimal
+    entry_price: Decimal
+    leverage: Decimal
+
+
 class AlertStore:
     def __init__(self, path: Path) -> None:
         self.connection = sqlite3.connect(path)
@@ -56,6 +68,20 @@ class AlertStore:
                 contract TEXT NOT NULL,
                 direction TEXT NOT NULL CHECK(direction IN ('up', 'down')),
                 target TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                contract TEXT NOT NULL,
+                side TEXT NOT NULL CHECK(side IN ('long', 'short')),
+                quantity TEXT NOT NULL,
+                entry_price TEXT NOT NULL,
+                leverage TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             )
             """
@@ -101,9 +127,53 @@ class AlertStore:
         self.connection.executemany("DELETE FROM alerts WHERE id = ?", [(item,) for item in alert_ids])
         self.connection.commit()
 
+    def add_position(
+        self, chat_id: int, contract: str, side: str, quantity: Decimal, entry_price: Decimal, leverage: Decimal
+    ) -> int:
+        count = self.connection.execute(
+            "SELECT COUNT(*) FROM positions WHERE chat_id = ?", (chat_id,)
+        ).fetchone()[0]
+        if count >= MAX_POSITIONS_PER_USER:
+            raise ValueError(f"每位用户最多只能保留 {MAX_POSITIONS_PER_USER} 个持仓。")
+        cursor = self.connection.execute(
+            """INSERT INTO positions(chat_id, contract, side, quantity, entry_price, leverage, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (chat_id, contract, side, str(quantity), str(entry_price), str(leverage), int(time.time())),
+        )
+        self.connection.commit()
+        return int(cursor.lastrowid)
+
+    def list_positions_for_chat(self, chat_id: int) -> list[Position]:
+        rows = self.connection.execute(
+            """SELECT id, chat_id, contract, side, quantity, entry_price, leverage
+               FROM positions WHERE chat_id = ? ORDER BY id""",
+            (chat_id,),
+        ).fetchall()
+        return [self._row_to_position(row) for row in rows]
+
+    def all_positions(self) -> list[Position]:
+        rows = self.connection.execute(
+            "SELECT id, chat_id, contract, side, quantity, entry_price, leverage FROM positions ORDER BY id"
+        ).fetchall()
+        return [self._row_to_position(row) for row in rows]
+
+    def delete_position(self, chat_id: int, position_id: int) -> bool:
+        cursor = self.connection.execute(
+            "DELETE FROM positions WHERE id = ? AND chat_id = ?", (position_id, chat_id)
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
+
     @staticmethod
     def _row_to_alert(row: sqlite3.Row) -> Alert:
         return Alert(row["id"], row["chat_id"], row["contract"], row["direction"], Decimal(row["target"]))
+
+    @staticmethod
+    def _row_to_position(row: sqlite3.Row) -> Position:
+        return Position(
+            row["id"], row["chat_id"], row["contract"], row["side"],
+            Decimal(row["quantity"]), Decimal(row["entry_price"]), Decimal(row["leverage"]),
+        )
 
 
 def normalize_contract(value: str) -> str:
@@ -133,6 +203,21 @@ def parse_target(value: str) -> Decimal:
     return target
 
 
+def parse_position_side(value: str) -> str:
+    aliases = {"long": "long", "多": "long", "多单": "long", "short": "short", "空": "short", "空单": "short"}
+    side = aliases.get(value.lower())
+    if not side:
+        raise ValueError("方向只能是 long（做多）或 short（做空）。")
+    return side
+
+
+def parse_leverage(value: str) -> Decimal:
+    leverage = parse_target(value)
+    if leverage > 125:
+        raise ValueError("杠杆必须在 1 到 125 之间。")
+    return leverage
+
+
 HELP_TEXT = """<b>Gate 合约价格提醒</b>
 
 设置提醒：<code>/set BTC 120000 up</code>
@@ -141,9 +226,15 @@ HELP_TEXT = """<b>Gate 合约价格提醒</b>
 查看提醒列表：<code>/list</code>
 删除提醒：<code>/delete 1</code>
 
+记录持仓：<code>/position BTC long 0.1 100000 10</code>
+查看持仓盈亏：<code>/pnl</code>
+查看持仓列表：<code>/positions</code>
+删除持仓：<code>/closeposition 1</code>
+
 <code>up</code>：价格 ≥ 目标价时触发。
 <code>down</code>：价格 ≤ 目标价时触发。
-每位用户最多可保留 3 条有效提醒；触发后自动关闭。"""
+持仓参数依次为：合约、方向（long/short）、数量、开仓价、杠杆。数量按币的实际数量输入。
+每位用户最多可保留 3 条提醒和 3 个持仓；提醒触发后自动关闭。"""
 
 
 class GateMonitor:
@@ -159,7 +250,9 @@ class GateMonitor:
 
     async def run(self) -> None:
         while True:
-            contracts = sorted({alert.contract for alert in self.store.all()})
+            contracts = sorted(
+                {alert.contract for alert in self.store.all()} | {position.contract for position in self.store.all_positions()}
+            )
             if not contracts:
                 self.reload_requested.clear()
                 await self.reload_requested.wait()
@@ -290,9 +383,111 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     value = get_monitor(context).last_prices.get(contract)
     if value is None:
-        await update.effective_message.reply_text("该合约尚未订阅或没有行情。先用 /set 添加监控；请确认合约名称正确。")
+        await update.effective_message.reply_text("该合约尚未订阅或没有行情。先用 /set 或 /position 添加；请确认合约名称正确。")
     else:
         await update.effective_message.reply_html(f"<code>{contract}</code> 最新成交价：<code>{value}</code> USDT")
+
+
+def format_usdt(value: Decimal) -> str:
+    return f"{value:,.2f}"
+
+
+def calculate_pnl(position: Position, current_price: Decimal) -> tuple[Decimal, Decimal, Decimal]:
+    multiplier = Decimal("1") if position.side == "long" else Decimal("-1")
+    pnl = (current_price - position.entry_price) * position.quantity * multiplier
+    initial_margin = position.entry_price * position.quantity / position.leverage
+    roe = pnl / initial_margin * Decimal("100")
+    return pnl, initial_margin, roe
+
+
+async def set_position(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args) != 5:
+        await update.effective_message.reply_text(
+            "用法：/position BTC long 0.1 100000 10\n参数：合约 方向 数量 开仓价 杠杆"
+        )
+        return
+    try:
+        contract = normalize_contract(context.args[0])
+        side = parse_position_side(context.args[1])
+        quantity = parse_target(context.args[2])
+        entry_price = parse_target(context.args[3])
+        leverage = parse_leverage(context.args[4])
+        position_id = get_store(context).add_position(
+            update.effective_chat.id, contract, side, quantity, entry_price, leverage
+        )
+    except ValueError as exc:
+        await update.effective_message.reply_text(str(exc))
+        return
+    get_monitor(context).request_reload()
+    side_text = "多单" if side == "long" else "空单"
+    await update.effective_message.reply_html(
+        f"持仓已记录 #{position_id}\n<code>{contract}</code> {side_text}\n"
+        f"数量：<code>{quantity}</code>\n开仓价：<code>{entry_price}</code> USDT\n"
+        f"杠杆：<code>{leverage}x</code>\n使用 /pnl 查询当前未实现盈亏。"
+    )
+
+
+async def pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    positions = get_store(context).list_positions_for_chat(update.effective_chat.id)
+    if not positions:
+        await update.effective_message.reply_text("暂无记录的持仓。用 /position 添加持仓。")
+        return
+    prices = get_monitor(context).last_prices
+    lines = ["<b>当前未实现盈亏</b>"]
+    unavailable: list[str] = []
+    total_pnl = Decimal("0")
+    total_margin = Decimal("0")
+    for position in positions:
+        current_price = prices.get(position.contract)
+        if current_price is None:
+            unavailable.append(position.contract)
+            continue
+        position_pnl, margin, roe = calculate_pnl(position, current_price)
+        total_pnl += position_pnl
+        total_margin += margin
+        side_text = "多" if position.side == "long" else "空"
+        lines.append(
+            f"\n#{position.id} <code>{position.contract}</code> {side_text}\n"
+            f"现价：<code>{current_price}</code>  开仓：<code>{position.entry_price}</code>\n"
+            f"未实现盈亏：<code>{format_usdt(position_pnl)}</code> USDT\n"
+            f"收益率：<code>{roe:.2f}%</code>  保证金：<code>{format_usdt(margin)}</code> USDT"
+        )
+    if total_margin:
+        total_roe = total_pnl / total_margin * Decimal("100")
+        lines.append(
+            f"\n<b>合计</b>\n未实现盈亏：<code>{format_usdt(total_pnl)}</code> USDT\n"
+            f"收益率：<code>{total_roe:.2f}%</code>"
+        )
+    if unavailable:
+        lines.append(f"\n正在获取 {', '.join(sorted(set(unavailable)))} 的行情，请稍后再次发送 /pnl。")
+    await update.effective_message.reply_html("\n".join(lines))
+
+
+async def list_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    positions = get_store(context).list_positions_for_chat(update.effective_chat.id)
+    if not positions:
+        await update.effective_message.reply_text("暂无记录的持仓。")
+        return
+    lines = ["<b>当前持仓</b>"]
+    for position in positions:
+        side_text = "多单" if position.side == "long" else "空单"
+        lines.append(
+            f"#{position.id} <code>{position.contract}</code> {side_text}  数量 <code>{position.quantity}</code>\n"
+            f"开仓 <code>{position.entry_price}</code>  杠杆 <code>{position.leverage}x</code>"
+        )
+    await update.effective_message.reply_html("\n".join(lines))
+
+
+async def close_position(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.effective_message.reply_text("用法：/closeposition 持仓编号，例如 /closeposition 1")
+        return
+    deleted = get_store(context).delete_position(update.effective_chat.id, int(context.args[0]))
+    if deleted:
+        get_monitor(context).request_reload()
+        await update.effective_message.reply_text("持仓记录已删除。")
+    else:
+        await update.effective_message.reply_text("未找到该持仓编号。")
 
 
 async def post_init(app: Application) -> None:
@@ -337,6 +532,10 @@ def main() -> None:
     app.add_handler(CommandHandler("list", list_alerts))
     app.add_handler(CommandHandler("delete", delete_alert))
     app.add_handler(CommandHandler("price", price))
+    app.add_handler(CommandHandler("position", set_position))
+    app.add_handler(CommandHandler("pnl", pnl))
+    app.add_handler(CommandHandler("positions", list_positions))
+    app.add_handler(CommandHandler("closeposition", close_position))
     app.run_polling(drop_pending_updates=True, bootstrap_retries=-1)
 
 
