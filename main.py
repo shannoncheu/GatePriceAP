@@ -1,6 +1,7 @@
 """Gate USDT perpetual-futures price alert bot for Telegram."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -15,20 +16,69 @@ from urllib.request import urlopen
 
 import websockets
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
+AI_ALLOWED_USER_IDS = {
+    int(item.strip())
+    for item in os.getenv("AI_ALLOWED_TELEGRAM_USER_IDS", "").split(",")
+    if item.strip().isdigit()
+}
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "alerts.db"))
 MAX_ALERTS_PER_USER = 3
 MAX_POSITIONS_PER_USER = 3
 MAX_WATCHLIST_PER_USER = 20
 GATE_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 GATE_REST_TICKERS_URL = "https://api.gateio.ws/api/v4/futures/usdt/tickers"
+AI_MAX_INPUT_LENGTH = 500
+AI_COOLDOWN_SECONDS = 3
+
+AI_INTENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["price", "pnl", "positions", "watchlist", "advice", "help", "chat"],
+        },
+        "symbols": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 5,
+        },
+    },
+    "required": ["action", "symbols"],
+    "additionalProperties": False,
+}
+
+AI_ROUTER_INSTRUCTIONS = """你是 Telegram Gate 合约机器人的意图分类器。
+只把用户消息分类，不回答问题，也不要猜测价格。
+action 规则：
+- price：询问一个或多个币种的当前价格；把币种代码放进 symbols。
+- pnl：询问当前持仓盈亏或收益率。
+- positions：只想查看已记录的持仓资料。
+- watchlist：想查看观察列表。
+- advice：要求结合持仓做简短分析、风险提示或建议。
+- help：询问机器人能做什么或怎么使用。
+- chat：其他与行情、合约或本机器人相关的问题。
+symbols 只写币种代码或合约名，例如 BTC、ETH、BTC_USDT；没有就返回空数组。
+不要把“比特币”翻译成中文代码，应返回 BTC；“以太坊”返回 ETH；“狗狗币”返回 DOGE。
+"""
+
+AI_ADVISER_INSTRUCTIONS = """你是嵌入 Gate 合约价格机器人的中文助手。
+只使用输入中标记为“程序提供的可靠数据”的内容谈论价格、持仓和盈亏；缺少数据时明确说明，绝不能编造。
+回答简短、自然、克制，通常 3 到 5 句。可以指出杠杆、仓位集中、浮亏扩大和止损计划等风险，但不要承诺收益，
+不要声称能预测行情，不要代替用户下单，也不要给出确定性的买入、卖出或加仓指令。
+如果用户只是普通提问，可以说明机器人功能或给出一般性的风险知识。
+涉及持仓分析时，末尾加上“仅供参考，不构成投资建议。”
+"""
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -281,6 +331,10 @@ HELP_TEXT = """<b>Gate 合约价格提醒</b>
 查看提醒列表：<code>/list</code>
 删除提醒：<code>/delete 1</code>
 
+也可以直接说：<code>BTC 现在多少钱</code>
+持仓分析：<code>看看我的持仓，简单说说风险</code>
+查看自己的用户 ID：<code>/whoami</code>
+
 记录持仓：<code>/position BTC long 0.1 100000 10</code>
 查看持仓盈亏：<code>/pnl</code>
 查看持仓列表：<code>/positions</code>
@@ -386,8 +440,23 @@ def get_monitor(context: ContextTypes.DEFAULT_TYPE) -> GateMonitor:
     return context.application.bot_data["monitor"]
 
 
+async def get_current_price(context: ContextTypes.DEFAULT_TYPE, contract: str) -> Decimal:
+    value = get_monitor(context).last_prices.get(contract)
+    if value is None:
+        value = await fetch_gate_price(contract)
+        get_monitor(context).last_prices[contract] = value
+    return value
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_html(HELP_TEXT)
+
+
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        f"你的 Telegram 用户 ID 是：{update.effective_user.id}\n"
+        "把这个数字填入 .env 的 AI_ALLOWED_TELEGRAM_USER_IDS。"
+    )
 
 
 async def set_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -442,14 +511,11 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except ValueError as exc:
         await update.effective_message.reply_text(str(exc))
         return
-    value = get_monitor(context).last_prices.get(contract)
-    if value is None:
-        try:
-            value = await fetch_gate_price(contract)
-        except ValueError as exc:
-            await update.effective_message.reply_text(str(exc))
-            return
-        get_monitor(context).last_prices[contract] = value
+    try:
+        value = await get_current_price(context, contract)
+    except ValueError as exc:
+        await update.effective_message.reply_text(str(exc))
+        return
     await update.effective_message.reply_html(
         f"<b>{contract}</b>\n最新成交价：<code>{value}</code> USDT"
     )
@@ -552,8 +618,11 @@ async def pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for position in positions:
         current_price = prices.get(position.contract)
         if current_price is None:
-            unavailable.append(position.contract)
-            continue
+            try:
+                current_price = await get_current_price(context, position.contract)
+            except ValueError:
+                unavailable.append(position.contract)
+                continue
         position_pnl, margin, roe = calculate_pnl(position, current_price)
         total_pnl += position_pnl
         total_margin += margin
@@ -602,11 +671,184 @@ async def close_position(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.effective_message.reply_text("未找到该持仓编号。")
 
 
+def ai_safety_identifier(user_id: int) -> str:
+    """Create a stable identifier without sending a Telegram ID to OpenAI."""
+    return hashlib.sha256(f"gate-price-ap:{user_id}".encode()).hexdigest()
+
+
+async def classify_ai_intent(client: AsyncOpenAI, text: str, safety_id: str) -> dict:
+    response = await client.responses.create(
+        model=OPENAI_MODEL,
+        instructions=AI_ROUTER_INSTRUCTIONS,
+        input=text,
+        reasoning={"effort": "low"},
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "telegram_intent",
+                "strict": True,
+                "schema": AI_INTENT_SCHEMA,
+            }
+        },
+        max_output_tokens=180,
+        safety_identifier=safety_id,
+    )
+    return json.loads(response.output_text)
+
+
+async def build_reliable_ai_data(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str:
+    store = get_store(context)
+    positions = store.list_positions_for_chat(chat_id)
+    alerts = store.list_for_chat(chat_id)
+    watchlist = store.list_watchlist_for_chat(chat_id)
+    lines = ["程序提供的可靠数据："]
+
+    if positions:
+        lines.append("已记录持仓：")
+        total_pnl = Decimal("0")
+        total_margin = Decimal("0")
+        for position in positions:
+            side_text = "多单" if position.side == "long" else "空单"
+            try:
+                current_price = await get_current_price(context, position.contract)
+                position_pnl, margin, roe = calculate_pnl(position, current_price)
+                total_pnl += position_pnl
+                total_margin += margin
+                lines.append(
+                    f"- {position.contract} {side_text}，数量 {position.quantity}，开仓价 {position.entry_price}，"
+                    f"杠杆 {position.leverage}x，现价 {current_price}，未实现盈亏 {position_pnl:.2f} USDT，"
+                    f"按初始保证金估算收益率 {roe:.2f}%"
+                )
+            except ValueError:
+                lines.append(
+                    f"- {position.contract} {side_text}，数量 {position.quantity}，开仓价 {position.entry_price}，"
+                    f"杠杆 {position.leverage}x；当前行情暂时不可用"
+                )
+        if total_margin:
+            total_roe = total_pnl / total_margin * Decimal("100")
+            lines.append(f"持仓合计未实现盈亏 {total_pnl:.2f} USDT，估算合计收益率 {total_roe:.2f}%")
+    else:
+        lines.append("已记录持仓：无")
+
+    if alerts:
+        alert_text = "；".join(
+            f"{item.contract} {'≥' if item.direction == 'up' else '≤'} {item.target}"
+            for item in alerts
+        )
+        lines.append(f"有效价格提醒：{alert_text}")
+    else:
+        lines.append("有效价格提醒：无")
+
+    if watchlist:
+        lines.append("观察列表：" + "、".join(item.contract for item in watchlist))
+    else:
+        lines.append("观察列表：无")
+    return "\n".join(lines)
+
+
+async def generate_ai_answer(
+    client: AsyncOpenAI,
+    user_text: str,
+    reliable_data: str,
+    safety_id: str,
+) -> str:
+    response = await client.responses.create(
+        model=OPENAI_MODEL,
+        instructions=AI_ADVISER_INSTRUCTIONS,
+        input=f"用户的问题：{user_text}\n\n{reliable_data}",
+        reasoning={"effort": "low"},
+        max_output_tokens=450,
+        safety_identifier=safety_id,
+    )
+    return response.output_text.strip()
+
+
+async def natural_language_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or not chat or not message.text:
+        return
+
+    client: AsyncOpenAI | None = context.application.bot_data.get("openai_client")
+    if client is None:
+        await message.reply_text("AI 功能还没有配置。请先在 VPS 的 .env 中填写 OPENAI_API_KEY。")
+        return
+    if not AI_ALLOWED_USER_IDS:
+        await message.reply_text(
+            "AI 功能还没有绑定允许用户。先发送 /whoami 查看你的 ID，"
+            "再把它填入 .env 的 AI_ALLOWED_TELEGRAM_USER_IDS。"
+        )
+        return
+    if user.id not in AI_ALLOWED_USER_IDS:
+        await message.reply_text("这个账号没有使用 AI 功能的权限。")
+        return
+
+    user_text = message.text.strip()
+    if len(user_text) > AI_MAX_INPUT_LENGTH:
+        await message.reply_text(f"这段话有点长，请控制在 {AI_MAX_INPUT_LENGTH} 个字符以内。")
+        return
+
+    now = time.monotonic()
+    last_used: dict[int, float] = context.application.bot_data["ai_last_used"]
+    if now - last_used.get(user.id, 0) < AI_COOLDOWN_SECONDS:
+        await message.reply_text("稍等几秒再问，避免重复消耗 API。")
+        return
+    last_used[user.id] = now
+    safety_id = ai_safety_identifier(user.id)
+
+    try:
+        intent = await classify_ai_intent(client, user_text, safety_id)
+        action = intent["action"]
+        symbols = intent.get("symbols", [])
+
+        if action == "price":
+            if not symbols:
+                await message.reply_text("你想查哪个币？例如：BTC 现在多少钱？")
+                return
+            lines = ["当前价格"]
+            for symbol in symbols[:5]:
+                try:
+                    contract = normalize_contract(symbol)
+                    value = await get_current_price(context, contract)
+                    lines.append(f"{contract.removesuffix('_USDT')}  {value} USDT")
+                except ValueError:
+                    lines.append(f"{symbol.upper()}  暂时查不到")
+            await message.reply_text("\n".join(lines))
+            return
+        if action == "pnl":
+            await pnl(update, context)
+            return
+        if action == "positions":
+            await list_positions(update, context)
+            return
+        if action == "watchlist":
+            await show_watchlist(update, context)
+            return
+        if action == "help":
+            await start(update, context)
+            return
+
+        reliable_data = await build_reliable_ai_data(context, chat.id)
+        answer = await generate_ai_answer(client, user_text, reliable_data, safety_id)
+        await message.reply_text(answer or "AI 暂时没有生成有效回答，请稍后再试。")
+    except Exception:
+        logger.exception("OpenAI request failed")
+        await message.reply_text("AI 暂时不可用。价格查询仍可使用 /price BTC，稍后再试即可。")
+
+
 async def post_init(app: Application) -> None:
     store = AlertStore(DATABASE_PATH)
     monitor = GateMonitor(app, store)
     app.bot_data["store"] = store
     app.bot_data["monitor"] = monitor
+    app.bot_data["ai_last_used"] = {}
+    if OPENAI_API_KEY:
+        app.bot_data["openai_client"] = AsyncOpenAI(
+            api_key=OPENAI_API_KEY,
+            timeout=25.0,
+            max_retries=1,
+        )
     monitor.task = asyncio.create_task(monitor.run(), name="gate-price-monitor")
     monitor.request_reload()
 
@@ -640,6 +882,7 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("set", set_alert))
     app.add_handler(CommandHandler("list", list_alerts))
     app.add_handler(CommandHandler("delete", delete_alert))
@@ -651,6 +894,7 @@ def main() -> None:
     app.add_handler(CommandHandler("pnl", pnl))
     app.add_handler(CommandHandler("positions", list_positions))
     app.add_handler(CommandHandler("closeposition", close_position))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_language_message))
     app.run_polling(drop_pending_updates=True, bootstrap_retries=-1)
 
 
