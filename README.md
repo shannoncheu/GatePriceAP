@@ -13,6 +13,7 @@
 - 每个 Telegram 用户最多 3 条有效提醒
 - 提醒触发后自动关闭
 - 提醒存储在本地 SQLite 数据库；服务重启后仍会保留
+- 手动记录合约持仓，按最新价计算未实现盈亏、保证金和收益率
 
 ## 命令
 
@@ -22,15 +23,21 @@
 /price BTC
 /list
 /delete 1
+/position BTC long 0.1 100000 10
+/pnl
+/positions
+/closeposition 1
 ```
+
+`/position` 参数依次为：合约、方向、实际持仓数量、开仓价、杠杆。方向支持 `long`（多单）和 `short`（空单）。
 
 ## 配置
 
 需要 Python 3.10 或更高版本。
 
 ```bash
-git clone https://github.com/shannoncheu/gate-price-alert-bot.git
-cd gate-price-alert-bot
+git clone https://github.com/shannoncheu/GatePriceAP.git
+cd GatePriceAP
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -63,9 +70,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/root/gate-price-alert-bot
-EnvironmentFile=/root/gate-price-alert-bot/.env
-ExecStart=/root/gate-price-alert-bot/.venv/bin/python /root/gate-price-alert-bot/main.py
+WorkingDirectory=/root/GatePriceAP
+EnvironmentFile=/root/GatePriceAP/.env
+ExecStart=/root/GatePriceAP/.venv/bin/python /root/GatePriceAP/main.py
 Restart=always
 RestartSec=5
 
