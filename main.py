@@ -10,6 +10,8 @@ from contextlib import suppress
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 import websockets
 from dotenv import load_dotenv
@@ -26,6 +28,7 @@ MAX_ALERTS_PER_USER = 3
 MAX_POSITIONS_PER_USER = 3
 MAX_WATCHLIST_PER_USER = 20
 GATE_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
+GATE_REST_TICKERS_URL = "https://api.gateio.ws/api/v4/futures/usdt/tickers"
 LOGO_URL_TEMPLATE = (
     "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/"
     "master/128/color/{symbol}.png"
@@ -277,6 +280,23 @@ async def send_contract_photo_or_text(
         await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
 
 
+def _fetch_gate_price_sync(contract: str) -> Decimal:
+    query = urlencode({"contract": contract})
+    with urlopen(f"{GATE_REST_TICKERS_URL}?{query}", timeout=10) as response:
+        payload = json.load(response)
+    if not payload:
+        raise ValueError("Gate 未找到这个合约。")
+    return Decimal(payload[0]["last"])
+
+
+async def fetch_gate_price(contract: str) -> Decimal:
+    """Fetch a price even when the contract is not in any local subscription."""
+    try:
+        return await asyncio.to_thread(_fetch_gate_price_sync, contract)
+    except (OSError, ValueError, KeyError, IndexError, InvalidOperation) as exc:
+        raise ValueError("暂时无法从 Gate 获取这个合约的价格，请确认币种名称后重试。") from exc
+
+
 HELP_TEXT = """<b>Gate 合约价格提醒</b>
 
 设置提醒：<code>/set BTC 120000 up</code>
@@ -449,14 +469,18 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     value = get_monitor(context).last_prices.get(contract)
     if value is None:
-        await update.effective_message.reply_text("该合约尚未订阅或没有行情。先用 /set 或 /position 添加；请确认合约名称正确。")
-    else:
-        await send_contract_photo_or_text(
-            context.bot,
-            update.effective_chat.id,
-            contract,
-            f"<b>{contract}</b>\n最新成交价：<code>{value}</code> USDT",
-        )
+        try:
+            value = await fetch_gate_price(contract)
+        except ValueError as exc:
+            await update.effective_message.reply_text(str(exc))
+            return
+        get_monitor(context).last_prices[contract] = value
+    await send_contract_photo_or_text(
+        context.bot,
+        update.effective_chat.id,
+        contract,
+        f"<b>{contract}</b>\n最新成交价：<code>{value}</code> USDT",
+    )
 
 
 async def set_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
