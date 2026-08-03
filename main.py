@@ -39,6 +39,7 @@ MAX_POSITIONS_PER_USER = 3
 MAX_WATCHLIST_PER_USER = 20
 GATE_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 GATE_REST_TICKERS_URL = "https://api.gateio.ws/api/v4/futures/usdt/tickers"
+GATE_REST_CANDLES_URL = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
 AI_MAX_INPUT_LENGTH = 500
 AI_COOLDOWN_SECONDS = 3
 
@@ -70,6 +71,7 @@ action 规则：
 - help：询问机器人能做什么或怎么使用。
 - chat：其他与行情、合约或本机器人相关的问题。
 symbols 只写币种代码或合约名，例如 BTC、ETH、BTC_USDT；没有就返回空数组。
+无论 action 是 price、advice 还是 chat，只要用户提到了币种，就必须把它放进 symbols。
 不要把“比特币”翻译成中文代码，应返回 BTC；“以太坊”返回 ETH；“狗狗币”返回 DOGE。
 """
 
@@ -77,8 +79,10 @@ AI_ADVISER_INSTRUCTIONS = """你是嵌入 Gate 合约价格机器人的中文助
 只使用输入中标记为“程序提供的可靠数据”的内容谈论价格、持仓和盈亏；缺少数据时明确说明，绝不能编造。
 回答简短、自然、克制，通常 3 到 5 句。可以指出杠杆、仓位集中、浮亏扩大和止损计划等风险，但不要承诺收益，
 不要声称能预测行情，不要代替用户下单，也不要给出确定性的买入、卖出或加仓指令。
+如果程序提供了 15 分钟行情指标，可以做条件式的多空情景分析，说明当前信号偏多、偏空或混合，
+以及值得观察的确认条件和失效风险；不要把技术指标说成确定预测。
 如果用户只是普通提问，可以说明机器人功能或给出一般性的风险知识。
-涉及持仓分析时，末尾加上“仅供参考，不构成投资建议。”
+涉及持仓或行情分析时，末尾加上“仅供参考，不构成投资建议。”
 """
 
 logging.basicConfig(
@@ -114,6 +118,16 @@ class Position:
 @dataclass(frozen=True)
 class WatchItem:
     contract: str
+
+
+@dataclass(frozen=True)
+class Candle:
+    timestamp: int
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
 
 
 class AlertStore:
@@ -322,6 +336,98 @@ async def fetch_gate_price(contract: str) -> Decimal:
         return await asyncio.to_thread(_fetch_gate_price_sync, contract)
     except (OSError, ValueError, KeyError, IndexError, InvalidOperation) as exc:
         raise ValueError("暂时无法从 Gate 获取这个合约的价格，请确认币种名称后重试。") from exc
+
+
+def _fetch_gate_candles_sync(contract: str, interval: str = "15m", limit: int = 120) -> list[Candle]:
+    query = urlencode({"contract": contract, "interval": interval, "limit": limit})
+    with urlopen(f"{GATE_REST_CANDLES_URL}?{query}", timeout=10) as response:
+        payload = json.load(response)
+    candles = [
+        Candle(
+            timestamp=int(item["t"]),
+            open=Decimal(item["o"]),
+            high=Decimal(item["h"]),
+            low=Decimal(item["l"]),
+            close=Decimal(item["c"]),
+            volume=Decimal(item.get("sum") or item.get("v") or "0"),
+        )
+        for item in payload
+    ]
+    candles.sort(key=lambda item: item.timestamp)
+    if len(candles) < 60:
+        raise ValueError("K 线数据不足。")
+    return candles
+
+
+async def fetch_gate_candles(contract: str, interval: str = "15m", limit: int = 120) -> list[Candle]:
+    try:
+        return await asyncio.to_thread(_fetch_gate_candles_sync, contract, interval, limit)
+    except (OSError, ValueError, KeyError, TypeError, InvalidOperation) as exc:
+        raise ValueError("暂时无法从 Gate 获取该合约的 K 线数据。") from exc
+
+
+def ema_series(values: list[Decimal], period: int) -> list[Decimal]:
+    if not values:
+        return []
+    alpha = Decimal("2") / Decimal(period + 1)
+    result = [values[0]]
+    for value in values[1:]:
+        result.append(value * alpha + result[-1] * (Decimal("1") - alpha))
+    return result
+
+
+def calculate_rsi(values: list[Decimal], period: int = 14) -> Decimal:
+    changes = [current - previous for previous, current in zip(values[-period - 1 : -1], values[-period:])]
+    if len(changes) < period:
+        raise ValueError("K 线数据不足以计算 RSI。")
+    average_gain = sum((max(change, Decimal("0")) for change in changes), Decimal("0")) / period
+    average_loss = sum((max(-change, Decimal("0")) for change in changes), Decimal("0")) / period
+    if average_loss == 0:
+        return Decimal("100")
+    relative_strength = average_gain / average_loss
+    return Decimal("100") - Decimal("100") / (Decimal("1") + relative_strength)
+
+
+def percent_change(current: Decimal, previous: Decimal) -> Decimal:
+    if previous == 0:
+        return Decimal("0")
+    return (current - previous) / previous * Decimal("100")
+
+
+def summarize_candles(contract: str, candles: list[Candle]) -> str:
+    # Ignore the newest candle because it may still be forming.
+    completed = candles[:-1]
+    closes = [item.close for item in completed]
+    volumes = [item.volume for item in completed]
+    ema20 = ema_series(closes, 20)
+    ema50 = ema_series(closes, 50)
+    ema12 = ema_series(closes, 12)
+    ema26 = ema_series(closes, 26)
+    macd = [fast - slow for fast, slow in zip(ema12, ema26)]
+    signal = ema_series(macd, 9)
+    rsi = calculate_rsi(closes)
+    latest = completed[-1]
+    recent20 = completed[-20:]
+    average_volume = sum(volumes[-21:-1], Decimal("0")) / Decimal("20")
+    volume_ratio = latest.volume / average_volume if average_volume else Decimal("0")
+
+    if latest.close > ema20[-1] > ema50[-1]:
+        trend = "均线排列偏多"
+    elif latest.close < ema20[-1] < ema50[-1]:
+        trend = "均线排列偏空"
+    else:
+        trend = "均线信号混合"
+    momentum = "MACD 在信号线上方" if macd[-1] > signal[-1] else "MACD 在信号线下方"
+
+    return (
+        f"{contract} Gate 15分钟已完成K线（最后时间戳 {latest.timestamp}）：\n"
+        f"- 收盘价 {latest.close}；1小时涨跌 {percent_change(latest.close, closes[-5]):.2f}%；"
+        f"近24小时涨跌 {percent_change(latest.close, closes[-97]):.2f}%\n"
+        f"- EMA20 {ema20[-1]:.4f}；EMA50 {ema50[-1]:.4f}；{trend}\n"
+        f"- RSI14 {rsi:.2f}；MACD {macd[-1]:.6f}；信号线 {signal[-1]:.6f}；{momentum}\n"
+        f"- 当前K线成交额相对前20根均值 {volume_ratio:.2f} 倍；"
+        f"近20根最高 {max(item.high for item in recent20)}；最低 {min(item.low for item in recent20)}"
+    )
 
 
 HELP_TEXT = """<b>Gate 合约价格提醒</b>
@@ -697,7 +803,11 @@ async def classify_ai_intent(client: AsyncOpenAI, text: str, safety_id: str) -> 
     return json.loads(response.output_text)
 
 
-async def build_reliable_ai_data(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str:
+async def build_reliable_ai_data(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    requested_contracts: list[str] | None = None,
+) -> str:
     store = get_store(context)
     positions = store.list_positions_for_chat(chat_id)
     alerts = store.list_for_chat(chat_id)
@@ -744,6 +854,18 @@ async def build_reliable_ai_data(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         lines.append("观察列表：" + "、".join(item.contract for item in watchlist))
     else:
         lines.append("观察列表：无")
+
+    market_contracts = list(dict.fromkeys(requested_contracts or []))
+    if not market_contracts and positions:
+        market_contracts = list(dict.fromkeys(position.contract for position in positions))
+    if market_contracts:
+        lines.append("Gate 公开技术行情（仅描述历史数据，不代表未来走势）：")
+        for contract in market_contracts[:3]:
+            try:
+                candles = await fetch_gate_candles(contract)
+                lines.append(summarize_candles(contract, candles))
+            except ValueError:
+                lines.append(f"{contract}：15分钟 K 线暂时不可用")
     return "\n".join(lines)
 
 
@@ -830,7 +952,13 @@ async def natural_language_message(update: Update, context: ContextTypes.DEFAULT
             await start(update, context)
             return
 
-        reliable_data = await build_reliable_ai_data(context, chat.id)
+        requested_contracts: list[str] = []
+        for symbol in symbols[:3]:
+            try:
+                requested_contracts.append(normalize_contract(symbol))
+            except ValueError:
+                continue
+        reliable_data = await build_reliable_ai_data(context, chat.id, requested_contracts)
         answer = await generate_ai_answer(client, user_text, reliable_data, safety_id)
         await message.reply_text(answer or "AI 暂时没有生成有效回答，请稍后再试。")
     except Exception:
