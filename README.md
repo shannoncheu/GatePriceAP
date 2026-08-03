@@ -70,11 +70,14 @@ cp .env.example .env
 TELEGRAM_BOT_TOKEN=从BotFather获取的Token
 OPENAI_API_KEY=你的OpenAI API Key
 OPENAI_MODEL=gpt-5.6-luna
+OPENAI_BASE_URL=
 AI_ALLOWED_TELEGRAM_USER_IDS=你的Telegram数字用户ID
 LOG_LEVEL=WARNING
 ```
 
 `OPENAI_API_KEY` 为空时，原来的命令功能仍可正常使用。部署后先向机器人发送 `/whoami` 获取自己的数字 ID，再填入允许名单；多人使用时用英文逗号分隔。允许名单可防止其他人消耗你的 OpenAI API 额度。
+
+使用 Sub2API 等 OpenAI 兼容中转服务时，`OPENAI_API_KEY` 填中转平台生成的 Key，`OPENAI_BASE_URL` 填平台提供的完整接口地址（一般以 `/v1` 结尾），`OPENAI_MODEL` 填该平台后台实际可用的模型名称。使用 OpenAI 官方 API 时，让 `OPENAI_BASE_URL` 保持为空。
 
 启动：
 
