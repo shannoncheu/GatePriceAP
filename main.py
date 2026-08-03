@@ -27,6 +27,7 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
 AI_ALLOWED_USER_IDS = {
     int(item.strip())
     for item in os.getenv("AI_ALLOWED_TELEGRAM_USER_IDS", "").split(",")
@@ -844,11 +845,14 @@ async def post_init(app: Application) -> None:
     app.bot_data["monitor"] = monitor
     app.bot_data["ai_last_used"] = {}
     if OPENAI_API_KEY:
-        app.bot_data["openai_client"] = AsyncOpenAI(
+        client_options = dict(
             api_key=OPENAI_API_KEY,
             timeout=25.0,
             max_retries=1,
         )
+        if OPENAI_BASE_URL:
+            client_options["base_url"] = OPENAI_BASE_URL
+        app.bot_data["openai_client"] = AsyncOpenAI(**client_options)
     monitor.task = asyncio.create_task(monitor.run(), name="gate-price-monitor")
     monitor.request_reload()
 
